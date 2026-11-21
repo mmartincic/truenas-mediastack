@@ -1,0 +1,7 @@
+# Personal notes (local IPs, user IDs, domains) stay on this machine
+NOTES.md
+
+# Generated on the server, contain API keys
+ACCESS.md
+stack.conf
+.env
