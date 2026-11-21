@@ -288,10 +288,14 @@ services:
       - ${MEDIA_ROOT}/apps/jellyfin/cache:/cache
       - ${MEDIA_ROOT}:/media
 
+  # Jellyseerr is now Seerr. Its image runs as UID 1000 unless told otherwise,
+  # so run it as PUID:PGID to match the owner of its config folder.
   jellyseerr:
-    image: fallenbagel/jellyseerr:latest
+    image: ghcr.io/seerr-team/seerr:latest
     container_name: jellyseerr
     restart: unless-stopped
+    init: true
+    user: "${PUID}:${PGID}"
     environment:
       TZ: ${TZ}
     ports:
@@ -468,10 +472,11 @@ def step(name, fn, *args):
 
 
 # ------------------------------------------------------------ qBittorrent --
-def qb_temp_password():
+def qb_temp_passwords():
+    """All temporary passwords qBittorrent has printed, oldest first."""
     p = subprocess.run(["docker", "logs", "qbittorrent"], capture_output=True, text=True)
-    m = re.findall(r"temporary password is provided for this session:\s*(\S+)", p.stdout + p.stderr)
-    return m[-1] if m else None
+    return re.findall(r"temporary password is provided for this session:\s*(\S+)",
+                      p.stdout + p.stderr)
 
 
 def qbittorrent():
@@ -479,16 +484,32 @@ def qbittorrent():
     wait_until("qBittorrent web UI", lambda: probe(f"{LOCAL}:8080/"))
 
     def login(u, p):
-        r = qb.post("/api/v2/auth/login", form={"username": u, "password": p})
-        return isinstance(r, str) and r.strip().lower().startswith("ok")
+        # 4.x: bad login is 200 "Fails.", good login 200 "Ok.".
+        # 5.x: bad login is HTTP 401 (403 when banned), good login 2xx with
+        # "Ok." or an empty body. So any 2xx that isn't "Fails." is a success.
+        try:
+            r = qb.post("/api/v2/auth/login", form={"username": u, "password": p})
+        except ApiError as e:
+            if "HTTP 401" in str(e) or "HTTP 403" in str(e):
+                return False
+            raise
+        return not (isinstance(r, str) and r.strip().lower().startswith("fail"))
 
+    # Exactly one attempt per credential: qBittorrent bans the client IP for an
+    # hour after 5 failed logins, and a ban also makes correct logins fail.
     if login(USER, PW):
         say("already using your admin login")
     else:
-        temp = wait_until("qBittorrent temporary password in logs", qb_temp_password, 120)
+        # A restart lifts any ban and prints a fresh temporary password.
+        seen = len(qb_temp_passwords())
+        say("restarting qBittorrent to get a fresh temporary password")
+        subprocess.run(["docker", "restart", "qbittorrent"], check=True, capture_output=True)
+        temp = wait_until("qBittorrent temporary password in logs",
+                          lambda: (qb_temp_passwords()[seen:] or [None])[-1], 120)
+        wait_until("qBittorrent web UI", lambda: probe(f"{LOCAL}:8080/"))
         if not login("admin", temp):
-            raise ApiError("couldn't log in with your password or the temporary one. "
-                           "Reset it in qBittorrent.conf, then re-run")
+            raise ApiError("qBittorrent has a password that is neither yours nor a temporary one. "
+                           "Set it to yours in the qBittorrent web UI, then re-run")
     qb.post("/api/v2/app/setPreferences", form={"json": json.dumps({
         "web_ui_username": USER,
         "web_ui_password": PW,
@@ -694,30 +715,28 @@ def jellyseerr(jf_key):
         good("already set up, leaving it alone")
         return
 
-    try:  # current API
-        s.post("/auth/jellyfin", {"username": USER, "password": PW, "email": EMAIL,
-                                  "hostname": "jellyfin", "port": 8096, "useSsl": False,
-                                  "urlBase": "", "serverType": 2})
-    except ApiError as first:
-        try:  # older releases took a full URL
-            s.post("/auth/jellyfin", {"username": USER, "password": PW, "email": EMAIL,
-                                      "hostname": "http://jellyfin:8096"})
-        except ApiError:
-            raise first
+    login = {"username": USER, "password": PW, "email": EMAIL, "serverType": 2}
+    try:
+        s.post("/auth/jellyfin", dict(login, hostname="jellyfin", port=8096,
+                                      useSsl=False, urlBase=""))
+    except ApiError as e:
+        if "hostname already configured" not in str(e):
+            raise ApiError(f"{e}. See: docker logs jellyseerr / docker logs jellyfin") from None
+        # an earlier run got this far; the server is stored, just sign in
+        s.post("/auth/jellyfin", login)
     say("signed in with your Jellyfin admin")
 
-    try:
-        cur = s.get("/settings/jellyfin")
-        cur.update(ip="jellyfin", port=8096, useSsl=False, urlBase="",
-                   externalHostname=f"http://{IP}:8096", apiKey=jf_key)
-        s.post("/settings/jellyfin", cur)
+    try:  # send only writable fields; name/libraries/serverID are read-only
+        s.post("/settings/jellyfin", {"ip": "jellyfin", "port": 8096, "useSsl": False,
+                                      "urlBase": "", "externalHostname": f"http://{IP}:8096",
+                                      "apiKey": jf_key})
     except ApiError as e:
         bad(f"couldn't store Jellyfin API key / external URL ({e}). Not critical")
 
-    libs = s.get("/settings/jellyfin/library", params={"sync": "true"})
+    libs = s.post("/settings/jellyfin/library/sync") or []
     ids = [l["id"] for l in libs if l.get("type") in ("movie", "show")]
-    if ids:
-        s.get("/settings/jellyfin/library", params={"enable": ",".join(ids)})
+    for lib_id in ids:
+        s.put(f"/settings/jellyfin/library/{lib_id}", {"enabled": True})
     say(f"{len(ids)} Jellyfin libraries enabled")
 
     radarr_api = Api(f"{LOCAL}:7878/api/v3", headers={"X-Api-Key": KEYS["radarr"]})
